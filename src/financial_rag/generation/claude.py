@@ -1,13 +1,19 @@
-"""Ollama-backed generator — runs fully local, no API key needed."""
+"""Anthropic Claude API-backed generator."""
 
-import re
+from __future__ import annotations
+
 from collections.abc import Iterator
-
-import ollama
 
 from financial_rag.generation.base import BaseGenerator
 from financial_rag.generation.models import ConversationTurn, GenerationResult
 from financial_rag.retrieval.models import RetrievalResult
+
+try:
+    import anthropic as _anthropic_lib
+    _ANTHROPIC_AVAILABLE = True
+except ImportError:
+    _anthropic_lib = None  # type: ignore[assignment]
+    _ANTHROPIC_AVAILABLE = False
 
 _SYSTEM_PROMPT = """\
 You are a financial analyst assistant for Peruvian bank annual reports.
@@ -26,32 +32,53 @@ _NO_CONTEXT_ANSWER = (
     "No encontré información relevante en los documentos para responder esta pregunta."
 )
 
-AVAILABLE_MODELS = [
-    "qwen3:4b",
-    "qwen3:8b",
-    "qwen3:14b",
-    "qwen2.5-coder:32b",
-    "mistral:latest",
+_DEFAULT_MODEL = "claude-sonnet-4-6"
+_MAX_TOKENS = 2048
+
+AVAILABLE_CLAUDE_MODELS = [
+    "claude-sonnet-4-6",
+    "claude-haiku-4-5",
+    "claude-opus-4-7",
 ]
 
 
-class OllamaGenerator(BaseGenerator):
-    """Generates grounded answers using a local Ollama model.
+class ClaudeGenerator(BaseGenerator):
+    """Generates grounded answers using the Anthropic Claude API.
+
+    Uses prompt caching on the system prompt to reduce cost and latency on
+    repeated calls. The cached system prompt is reused for the lifetime of
+    the process (ephemeral cache, up to 5 minutes TTL on the Anthropic side).
 
     Args:
-        model: Ollama model tag. Must be pulled before use.
-            Options: qwen3:4b (fast), qwen3:8b (balanced), qwen3:14b (quality).
-        think: If True, enables Qwen3 thinking mode (slower but more accurate
-            for complex financial reasoning). Only supported by Qwen3 models.
+        model: Claude model ID (default: claude-sonnet-4-6).
+        api_key: Anthropic API key. Reads ANTHROPIC_API_KEY env var if None.
+        max_tokens: Maximum output tokens per response.
+        _client: Inject a pre-built client (for unit tests — avoids API calls).
     """
 
     def __init__(
         self,
-        model: str = "qwen3:8b",
-        think: bool = False,
+        model: str = _DEFAULT_MODEL,
+        api_key: str | None = None,
+        max_tokens: int = _MAX_TOKENS,
+        _client: object | None = None,
     ) -> None:
+        if not _ANTHROPIC_AVAILABLE and _client is None:
+            raise ImportError(
+                "The 'anthropic' package is required for ClaudeGenerator. "
+                "Install it with: pip install 'financial-rag-assistant[claude]'"
+            )
         self._model = model
-        self._think = think
+        self._max_tokens = max_tokens
+        self._client = _client or _anthropic_lib.Anthropic(api_key=api_key)
+        # Cache the system prompt — tokens are reused across requests
+        self._system = [
+            {
+                "type": "text",
+                "text": _SYSTEM_PROMPT,
+                "cache_control": {"type": "ephemeral"},
+            }
+        ]
 
     def generate(
         self,
@@ -66,20 +93,20 @@ class OllamaGenerator(BaseGenerator):
                 model=self._model,
             )
 
-        response = ollama.chat(
+        response = self._client.messages.create(
             model=self._model,
-            think=self._think,
+            max_tokens=self._max_tokens,
+            system=self._system,
             messages=self._build_messages(retrieval_result, history),
         )
 
-        answer = self._clean_answer(response.message.content)
         return GenerationResult(
-            answer=answer,
+            answer=response.content[0].text,
             query=retrieval_result.query,
             citations=retrieval_result.citations,
             model=self._model,
-            input_tokens=response.prompt_eval_count or 0,
-            output_tokens=response.eval_count or 0,
+            input_tokens=response.usage.input_tokens,
+            output_tokens=response.usage.output_tokens,
         )
 
     def stream(
@@ -88,56 +115,31 @@ class OllamaGenerator(BaseGenerator):
         history: list[ConversationTurn] | None = None,
         model: str | None = None,
     ) -> Iterator[str]:
-        """Yield clean answer tokens, filtering out <think> blocks.
-
-        Args:
-            retrieval_result: Retrieved chunks and query.
-            history: Prior conversation turns.
-            model: Override the instance model for this request.
-        """
         if retrieval_result.is_empty:
             yield _NO_CONTEXT_ANSWER
             return
 
-        model_name = model or self._model
-        full_text = ""
-        in_think = False
-
-        for chunk in ollama.chat(
-            model=model_name,
-            think=self._think,
+        with self._client.messages.stream(
+            model=model or self._model,
+            max_tokens=self._max_tokens,
+            system=self._system,
             messages=self._build_messages(retrieval_result, history),
-            stream=True,
-        ):
-            token = chunk.message.content or ""
-            full_text += token
-
-            if "<think>" in full_text:
-                in_think = True
-            if "</think>" in full_text:
-                in_think = False
-                full_text = re.sub(r"<think>.*?</think>", "", full_text, flags=re.DOTALL)
-                continue
-            if in_think:
-                continue
-
-            if token:
-                yield token
+        ) as stream:
+            yield from stream.text_stream
 
     def _build_messages(
         self,
         retrieval_result: RetrievalResult,
         history: list[ConversationTurn] | None = None,
     ) -> list[dict]:
-        context_text = self._format_context(retrieval_result)
-        messages: list[dict] = [{"role": "system", "content": _SYSTEM_PROMPT}]
+        messages: list[dict] = []
         for turn in (history or []):
             messages.append({"role": turn.role, "content": turn.content})
-        messages.append({"role": "user", "content": f"{context_text}\n\nPregunta: {retrieval_result.query}"})
+        messages.append({
+            "role": "user",
+            "content": f"{self._format_context(retrieval_result)}\n\nPregunta: {retrieval_result.query}",
+        })
         return messages
-
-    def _clean_answer(self, text: str) -> str:
-        return re.sub(r"<think>.*?</think>", "", text, flags=re.DOTALL).strip()
 
     def _format_context(self, retrieval_result: RetrievalResult) -> str:
         lines = ["Contexto:"]
@@ -148,4 +150,4 @@ class OllamaGenerator(BaseGenerator):
         return "\n".join(lines)
 
     def __repr__(self) -> str:
-        return f"OllamaGenerator(model={self._model!r}, think={self._think})"
+        return f"ClaudeGenerator(model={self._model!r}, max_tokens={self._max_tokens})"
